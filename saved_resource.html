@@ -1,0 +1,1996 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        // storage.get and .list calls not yet answered, read by the parent at this frame's 'load' (an answer may restyle the page); counted
+        // here, not there, because WebKit can run this frame's 'load' in the parent before a message posted while parsing has arrived.
+        let storageReadsOut = 0;
+        try { Object.defineProperty(window, '__storageReadsOut', { configurable: true, get: () => storageReadsOut }); } catch (e) {}
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+              storageReadsOut += 1;
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+              storageReadsOut += 1;
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        const onLinkClick = (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+        };
+        window.addEventListener('click', onLinkClick);
+
+        // HACK: a click on an <a download> that is not in the document, or a dispatched click that does not bubble, never reaches the window
+        // listener, so the link gets a listener of its own while its click() or dispatchEvent() runs, after the artifact's. Change with app/page.tsx.
+        const RealAnchor = window.HTMLAnchorElement;
+        const RealMouseEvent = window.MouseEvent;
+        const anchorProto = RealAnchor?.prototype;
+        const superProto = anchorProto && Object.getPrototypeOf(anchorProto);
+        if (typeof RealAnchor === 'function' && typeof RealMouseEvent === 'function' && typeof superProto?.click === 'function' && typeof superProto?.dispatchEvent === 'function') {
+          const onMissedClick = (event) => {
+            if (!event.defaultPrevented) onLinkClick(event);
+          };
+          // Links whose click() or dispatchEvent() is running, so a call made during it leaves the outer call's listener in place.
+          const listening = new WeakSet();
+          const callHearingMissed = (anchor, bubbles, call) => {
+            if (!(anchor instanceof RealAnchor) || !anchor.hasAttribute('download') || (anchor.isConnected && bubbles) || listening.has(anchor)) {
+              return call();
+            }
+            listening.add(anchor);
+            anchor.addEventListener('click', onMissedClick);
+            try {
+              return call();
+            } finally {
+              listening.delete(anchor);
+              anchor.removeEventListener('click', onMissedClick);
+            }
+          };
+          anchorProto.click = function () {
+            return callHearingMissed(this, true, () => superProto.click.call(this));
+          };
+          anchorProto.dispatchEvent = function (event) {
+            const call = () => superProto.dispatchEvent.call(this, event);
+            return event instanceof RealMouseEvent && event.type === 'click' ? callHearingMissed(this, event.bubbles, call) : call();
+          };
+        }
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+
+        // Last, so that if this throws, everything above is already set up. In its own function, so that its names stay local.
+        (() => {
+          function forwardConsole(e,l){const f=String,r=Reflect.apply;let i=0;const p=n=>i>3&&(typeof n=="function"||typeof n=="object"&&n!==null)?"[object Object]":n,u=n=>{try{return f(n??"")}catch{return"[object Object]"}},s=[["log",""],["error","Error: "],["warn","Warning: "]];for(const[n,y]of s){if(typeof e?.[n]!="function")continue;const d=e[n];e[n]=(...o)=>{let c=y;i+=1;try{for(let t=0;t<o.length;t+=1)o[t]=p(o[t]);r(d,e,o);for(let t=0;t<o.length;t+=1)c+=(t===0?"":" ")+u(o[t])}finally{i-=1}l(c)}}}
+          forwardConsole(window.console, (line) => realParent.postMessage({ type: 'console', message: line }, '*'));
+        })();
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style>
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
+<title>Exponent Detective Agency — Case Files</title>
+<style>
+  :root{
+    --navy-deep:#0c1626;
+    --navy-mid:#152438;
+    --navy-panel:#1b2e46;
+    --navy-line:#2c4a70;
+    --brass:#c9a24b;
+    --brass-bright:#e8c46e;
+    --brass-dim:#8a6f2f;
+    --parchment:#f2e9d3;
+    --parchment-dark:#e6d9b8;
+    --ink:#241a0f;
+    --ink-soft:#4a3c26;
+    --green:#2f7a4d;
+    --green-bg:#dcf3e3;
+    --red:#a13030;
+    --red-bg:#f6dcdc;
+    --shadow:rgba(0,0,0,.45);
+    --font-head:Georgia,'Times New Roman',serif;
+    --font-body:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --font-code:"Courier New",Courier,monospace;
+  }
+
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:
+      radial-gradient(ellipse at 20% -10%, #1c3350 0%, transparent 55%),
+      radial-gradient(ellipse at 100% 110%, #1a2c46 0%, transparent 50%),
+      var(--navy-deep);
+    color:var(--parchment);
+    font-family:var(--font-body);
+    min-height:100vh;
+    line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  #app{
+    max-width:900px;
+    margin:0 auto;
+    padding:18px 16px 60px;
+  }
+
+  /* ---------- Masthead ---------- */
+  .masthead{
+    position:relative;
+    text-align:center;
+    padding:22px 16px 20px;
+    background:linear-gradient(180deg,var(--navy-panel),var(--navy-mid));
+    border:1px solid #33507a;
+    border-radius:10px;
+    margin-bottom:18px;
+  }
+  .masthead-title{
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    gap:12px;
+    font-family:var(--font-head);
+    font-weight:700;
+    font-size:1.55rem;
+    letter-spacing:2px;
+    color:var(--brass-bright);
+    text-transform:uppercase;
+  }
+  .masthead-sub{
+    font-family:var(--font-head);
+    font-style:italic;
+    font-size:.9rem;
+    color:#c9d4e6;
+    margin-top:6px;
+  }
+  .masthead-sound{
+    position:absolute;
+    top:16px;
+    right:16px;
+  }
+  @media (max-width:560px){
+    .masthead-title{font-size:1.1rem;letter-spacing:1px;}
+    .masthead-sound{position:static;display:block;margin:0 auto 12px;}
+  }
+
+  /* ---------- Mission panel (Mission X of 6 + score + dots) ---------- */
+  .mission-panel{
+    background:var(--navy-mid);
+    border:1px solid #33507a;
+    border-radius:10px;
+    padding:14px 16px 18px;
+    margin-bottom:18px;
+  }
+  .mission-panel-top{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    font-family:var(--font-code);
+    font-size:.85rem;
+    color:var(--parchment);
+    margin-bottom:8px;
+  }
+  .mission-panel-top span:last-child{color:var(--brass-bright);}
+  .progress-track{
+    height:8px;
+    background:#0a1522;
+    border-radius:6px;
+    overflow:hidden;
+    border:1px solid #34517c;
+  }
+  .progress-fill{
+    height:100%;
+    background:linear-gradient(90deg,var(--brass-dim),var(--brass-bright));
+    border-radius:6px;
+    transition:width .5s ease;
+  }
+  .dot-row{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    margin-top:14px;
+    padding:0 4px;
+  }
+  .dot{
+    width:28px;height:28px;
+    border-radius:50%;
+    display:flex;align-items:center;justify-content:center;
+    font-family:var(--font-code);
+    font-size:.78rem;
+    color:#8496b0;
+    border:2px solid #34517c;
+    background:#0a1522;
+    flex:none;
+  }
+  .dot.active{
+    border-color:var(--brass-bright);
+    color:var(--brass-bright);
+    box-shadow:0 0 0 3px rgba(232,196,110,.2);
+  }
+  .dot.done{
+    background:var(--brass-dim);
+    border-color:var(--brass-dim);
+    color:#241a0f;
+  }
+
+  .sound-btn{
+    background:#0a1522;
+    border:1px solid #34517c;
+    color:var(--parchment);
+    border-radius:6px;
+    padding:7px 12px;
+    font-size:.85rem;
+    cursor:pointer;
+    white-space:nowrap;
+    font-family:var(--font-body);
+    transition:border-color .15s ease, background .15s ease;
+  }
+  .sound-btn:hover{border-color:var(--brass);}
+  .sound-btn:focus-visible, button:focus-visible, .slot:focus-visible, .tile:focus-visible{
+    outline:3px solid var(--brass-bright);
+    outline-offset:2px;
+  }
+
+  /* ---------- Cards / panels ---------- */
+  .card{
+    background:linear-gradient(180deg,#fbf5e6,var(--parchment));
+    color:var(--ink);
+    border-radius:10px;
+    padding:26px 24px;
+    box-shadow:0 14px 34px var(--shadow);
+    border:1px solid #cbb98a;
+    position:relative;
+  }
+  .card::before{
+    content:"";
+    position:absolute;
+    inset:8px;
+    border:1px dashed #b7a26a;
+    border-radius:6px;
+    pointer-events:none;
+    opacity:.55;
+  }
+  .case-tag{
+    display:inline-block;
+    font-family:var(--font-code);
+    font-size:.72rem;
+    letter-spacing:1px;
+    background:var(--ink);
+    color:var(--parchment);
+    padding:4px 10px;
+    border-radius:4px;
+    margin-bottom:12px;
+  }
+  h1,h2,h3{
+    font-family:var(--font-head);
+    color:var(--ink);
+    margin:0 0 10px;
+    line-height:1.2;
+  }
+  h1{font-size:1.7rem;}
+  h2{font-size:1.35rem;}
+  h3{font-size:1.1rem;}
+  p{margin:0 0 12px;color:var(--ink-soft);}
+  .lede{font-size:1.02rem;}
+
+  .btn{
+    display:inline-flex;
+    align-items:center;
+    gap:8px;
+    font-family:var(--font-body);
+    font-weight:600;
+    font-size:.95rem;
+    padding:12px 20px;
+    border-radius:8px;
+    border:2px solid var(--ink);
+    background:var(--ink);
+    color:var(--parchment);
+    cursor:pointer;
+    transition:transform .1s ease, background .15s ease;
+  }
+  .btn:hover{background:#3a2c17;transform:translateY(-1px);}
+  .btn:active{transform:translateY(0);}
+  .btn-gold{
+    background:var(--brass);
+    border-color:var(--brass-dim);
+    color:#241a0f;
+  }
+  .btn-gold:hover{background:var(--brass-bright);}
+  .btn[disabled]{opacity:.4;cursor:not-allowed;transform:none;}
+  .btn-row{display:flex;gap:12px;flex-wrap:wrap;margin-top:18px;}
+
+  /* ---------- Mission list on intro ---------- */
+  .case-list{list-style:none;margin:14px 0 0;padding:0;display:grid;gap:10px;}
+  .case-list li{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    padding:10px 12px;
+    background:rgba(36,26,15,.05);
+    border:1px solid #d9c99a;
+    border-radius:7px;
+    font-size:.92rem;
+  }
+  .case-list .num{
+    font-family:var(--font-code);
+    background:var(--ink);
+    color:var(--parchment);
+    width:26px;height:26px;
+    border-radius:50%;
+    display:flex;align-items:center;justify-content:center;
+    font-size:.78rem;
+    flex:none;
+  }
+
+  /* ---------- "Learn the law" screen ---------- */
+  .teach-card{ text-align:center; }
+  .eyebrow-gold{
+    font-family:var(--font-code);
+    font-size:.78rem;
+    letter-spacing:2.5px;
+    color:var(--brass-dim);
+    text-transform:uppercase;
+    margin-bottom:6px;
+  }
+  .teach-title{ text-align:center; }
+  .rule-box-tan{
+    display:flex;
+    flex-wrap:wrap;
+    align-items:center;
+    justify-content:center;
+    gap:10px;
+    background:var(--parchment-dark);
+    border-left:4px solid var(--brass);
+    border-radius:6px;
+    padding:16px 20px;
+    margin:16px auto;
+  }
+  .rule-eq{
+    font-family:var(--font-code);
+    font-size:1.1rem;
+    color:var(--ink);
+    white-space:nowrap;
+  }
+  .rule-sep{ color:var(--brass-dim); font-weight:700; }
+  .rule-caption{
+    font-family:var(--font-body);
+    font-weight:600;
+    color:var(--ink-soft);
+  }
+  .teach-flavor{
+    max-width:600px;
+    margin:0 auto 6px;
+    text-align:center;
+  }
+  .btn-row.center{ justify-content:center; }
+
+  /* ---------- Rule banner (used on "solved" recap screens) ---------- */
+  .rule-banner{
+    font-family:var(--font-code);
+    font-size:1.3rem;
+    text-align:center;
+    background:var(--ink);
+    color:var(--brass-bright);
+    padding:16px;
+    border-radius:8px;
+    margin:14px 0;
+    letter-spacing:1px;
+    white-space:nowrap;
+    overflow-x:auto;
+  }
+  /* ---------- Drag and drop ---------- */
+  .equation-row{
+    display:flex;
+    flex-wrap:nowrap;
+    align-items:center;
+    justify-content:flex-start;
+    gap:8px;
+    font-family:var(--font-code);
+    font-size:1.4rem;
+    background:#fff9ea;
+    border:1px solid #d9c99a;
+    border-radius:8px;
+    padding:20px 14px;
+    margin:16px 0;
+    overflow-x:auto;
+  }
+  @media (min-width:640px){
+    .equation-row{justify-content:center;}
+  }
+  @media (max-width:480px){
+    .equation-row{font-size:1.1rem;}
+  }
+  .eq-static{color:var(--ink);white-space:nowrap;}
+  .slot{
+    min-width:56px;
+    min-height:46px;
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    border:2px dashed #9a875a;
+    border-radius:8px;
+    background:#fff;
+    padding:4px 10px;
+    color:var(--ink);
+    cursor:pointer;
+    transition:border-color .15s ease, background .2s ease, transform .12s ease;
+  }
+  .slot.filled{border-style:solid;}
+  .slot.correct{
+    background:var(--green-bg);
+    border-color:var(--green);
+    color:var(--green);
+    font-weight:700;
+  }
+  .slot.incorrect{
+    background:var(--red-bg);
+    border-color:var(--red);
+    color:var(--red);
+    animation:shake .3s ease;
+  }
+  .slot.dragover{background:#f4e9c8;}
+  @keyframes shake{
+    0%,100%{transform:translateX(0);}
+    25%{transform:translateX(-4px);}
+    75%{transform:translateX(4px);}
+  }
+
+  .tile-bank{
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+    justify-content:center;
+    margin:16px 0;
+    padding:14px;
+    background:rgba(36,26,15,.05);
+    border:1px dashed #b7a26a;
+    border-radius:8px;
+  }
+  .tile{
+    font-family:var(--font-code);
+    font-size:1.15rem;
+    background:var(--navy-panel);
+    color:var(--brass-bright);
+    border:2px solid var(--brass-dim);
+    border-radius:8px;
+    padding:8px 16px;
+    cursor:grab;
+    user-select:none;
+    transition:transform .12s ease, box-shadow .12s ease;
+  }
+  .tile:hover{transform:translateY(-2px);box-shadow:0 4px 10px rgba(0,0,0,.3);}
+  .tile.selected{
+    background:var(--brass);
+    color:#241a0f;
+    border-color:var(--ink);
+    box-shadow:0 0 0 3px rgba(201,162,75,.4);
+  }
+  .tile.used{opacity:0;pointer-events:none;width:0;padding:0;margin:0;overflow:hidden;}
+  .tile[dragging]{opacity:.4;}
+
+  .feedback{
+    margin-top:14px;
+    padding:12px 14px;
+    border-radius:8px;
+    font-size:.95rem;
+    display:none;
+  }
+  .feedback.show{display:block;}
+  .feedback.good{background:var(--green-bg);color:var(--green);border:1px solid var(--green);}
+  .feedback.bad{background:var(--red-bg);color:var(--red);border:1px solid var(--red);}
+
+  .unlock-box{
+    text-align:center;
+    background:linear-gradient(180deg,#fff6d9,#f5e6b0);
+    border:2px solid var(--brass);
+    border-radius:10px;
+    padding:18px;
+    margin-top:16px;
+  }
+  .unlock-box h3{color:var(--brass-dim);}
+
+  /* ---------- MCQ ---------- */
+  .question-expr{
+    font-family:var(--font-code);
+    font-size:1.9rem;
+    text-align:center;
+    background:#fff9ea;
+    border:1px solid #d9c99a;
+    border-radius:8px;
+    padding:20px;
+    margin:16px 0;
+    color:var(--ink);
+  }
+  .option-grid{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:12px;
+    margin:14px 0;
+  }
+  @media (max-width:520px){
+    .option-grid{grid-template-columns:1fr;}
+  }
+  .option-btn{
+    font-family:var(--font-code);
+    font-size:1.15rem;
+    padding:16px 12px;
+    border:2px solid var(--ink);
+    border-radius:8px;
+    background:#fff;
+    color:var(--ink);
+    cursor:pointer;
+    text-align:center;
+    transition:background .15s ease, transform .1s ease;
+  }
+  .option-btn:hover:not([disabled]){background:#f4e9c8;transform:translateY(-1px);}
+  .option-btn.correct{background:var(--green-bg);border-color:var(--green);color:var(--green);font-weight:700;}
+  .option-btn.incorrect{background:var(--red-bg);border-color:var(--red);color:var(--red);}
+  .option-btn[disabled]{cursor:default;}
+
+  .q-tracker{
+    font-family:var(--font-code);
+    font-size:.8rem;
+    color:var(--ink-soft);
+    text-align:center;
+    margin-bottom:4px;
+    letter-spacing:.5px;
+  }
+
+  .hint-icon{font-size:1.1rem;margin-right:6px;}
+
+  /* ---------- Certificate ---------- */
+  .certificate{
+    text-align:center;
+    border:6px double var(--brass-dim);
+    padding:34px 20px;
+    background:#fffaf0;
+  }
+  .certificate .seal{font-size:2.6rem;margin-bottom:6px;}
+  .certificate h1{font-size:1.5rem;letter-spacing:1px;}
+  .certificate .name{
+    font-family:var(--font-head);
+    font-style:italic;
+    font-size:1.8rem;
+    color:var(--brass-dim);
+    margin:14px 0;
+    border-bottom:2px solid var(--brass-dim);
+    display:inline-block;
+    padding:0 20px 6px;
+  }
+  .name-input-row{
+    display:flex;
+    gap:10px;
+    flex-wrap:wrap;
+    margin:16px 0;
+  }
+  .name-input-row input{
+    flex:1 1 200px;
+    padding:12px 14px;
+    font-size:1rem;
+    border-radius:8px;
+    border:2px solid #cbb98a;
+    font-family:var(--font-body);
+  }
+
+  footer.note{
+    text-align:center;
+    font-size:.78rem;
+    color:#8496b0;
+    margin-top:22px;
+  }
+
+  @media print{
+    body{background:#fff;}
+    .hud, .btn-row, footer.note{display:none;}
+  }
+
+  .visually-hidden{
+    position:absolute;width:1px;height:1px;overflow:hidden;
+    clip:rect(0 0 0 0);white-space:nowrap;
+  }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<div id="app"><div class="masthead">
+      <button class="sound-btn masthead-sound" id="soundToggle" aria-pressed="false">
+        🔇 Sound OFF
+      </button>
+      <div class="masthead-title"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <circle cx="10.5" cy="10.5" r="6.5" stroke="#e8c46e" stroke-width="2"></circle>
+    <line x1="15.2" y1="15.2" x2="21" y2="21" stroke="#e8c46e" stroke-width="2.4" stroke-linecap="round"></line>
+  </svg> <span>Exponent Detective Agency</span></div>
+      <div class="masthead-sub">Case File No. 8 — The Mystery of the Missing Exponent Rules</div>
+    </div><div class="mission-panel">
+      <div class="mission-panel-top">
+        <span>Mission 1 of 6</span>
+        <span id="scoreDisplay">★ 0 pts</span>
+      </div>
+      <div class="progress-track"><div class="progress-fill" style="width:6%"></div></div>
+      <div class="dot-row"><div class="dot active">1</div><div class="dot">2</div><div class="dot">3</div><div class="dot">4</div><div class="dot">5</div><div class="dot">6</div></div>
+    </div><div class="card teach-card">
+      <div class="eyebrow-gold">MISSION 1 OF 6</div>
+      <h2 class="teach-title">The Case of the Combined Clues</h2>
+      <div class="rule-box-tan">
+        <span class="rule-eq">aᵐ × aⁿ = aᵐ⁺ⁿ</span>
+        <span class="rule-sep">—</span>
+        <span class="rule-caption">Same base? ADD the exponents.</span>
+      </div>
+      <p class="teach-flavor">Detective, our first case: when suspects (powers) with the SAME base team up by multiplying, their exponents combine. Your job — figure out HOW they combine. Watch out for imposters who multiply the exponents instead!</p>
+      <div class="btn-row center">
+        <button class="btn btn-gold" id="toDragBtn">Begin Investigation →</button>
+      </div>
+    </div><footer class="note">🔎 Exponent Detective Agency — a Grade 8 exponent-law training file. No external resources used.</footer></div>
+
+<script>
+/* =========================================================================
+   EXPONENT DETECTIVE AGENCY
+   A single-file interactive simulation teaching the Grade 8 Laws of Exponents
+   through a detective / code-breaker theme.
+
+   Code map:
+   1. DATA        - the five laws, their drag-and-drop rule builders, and
+                     their multiple-choice questions (with misconception
+                     based distractors + hints), plus Mission 6 (mixed) and
+                     the Final Challenge.
+   2. STATE       - a tiny app state object + the ordered list of screens.
+   3. UTILITIES   - shuffle, speech (text-to-speech), small DOM helpers.
+   4. RENDERERS   - one function per screen type, all writing into #app.
+   5. INIT        - kicks the app off.
+   ========================================================================= */
+
+/* ---------------------------- 1. DATA ---------------------------------- */
+
+// Each "law" describes one mission: its rule, its drag-and-drop rule-builder,
+// and its bank of multiple-choice questions.
+const LAWS = [
+  {
+    key: 'product',
+    title: 'The Product Law',
+    caseNo: 'CASE FILE 01',
+    rule: 'aᵐ × aⁿ = aᵐ⁺ⁿ',
+    ruleSpoken: 'a to the m, times a to the n, equals a to the power of m plus n.',
+    explain: 'When you multiply two powers with the SAME base, keep the base and ADD the exponents together.',
+    missionTitle: 'The Case of the Combined Clues',
+    caption: 'Same base? ADD the exponents.',
+    flavor: 'Detective, our first case: when suspects (powers) with the SAME base team up by multiplying, their exponents combine. Your job — figure out HOW they combine. Watch out for imposters who multiply the exponents instead!',
+    dragdrop: {
+      instructions: 'Build the Product Law. Drag the missing operation and the missing exponent into the empty slots.',
+      template: ['aᵐ', {slot:'op'}, 'aⁿ', '=', 'a', {slot:'exp', sup:true}],
+      slots: {
+        op:  { correct:'×', options:['×','+','÷'],
+               hint:'Think about what is happening between the two powers here — is it multiplication, addition, or division? Look at the mission title for a clue!' },
+        exp: { correct:'m+n', options:['m+n','m×n','m−n'],
+               hint:'Remember: aᵐ×aⁿ means (a×a×...×a) with m of them, times (a×a×...×a) with n of them. Count ALL the a\'s together — what operation gives you the total?' }
+      }
+    },
+    questions: [
+      { expr:'3⁴ × 3⁵', correct:'3⁹', distractors:[
+        {text:'3²⁰', hint:'When multiplying powers with the SAME base, do we multiply exponents or add them? Think of 2³×2⁴ = (2×2×2)×(2×2×2×2). Count the 2s!'},
+        {text:'9⁹',  hint:'The base stays the SAME — you never multiply the bases together. Only the exponents change.'},
+        {text:'3¹',  hint:'We ADD the exponents here, we don\'t subtract them, when multiplying powers with the same base.'}
+      ]},
+      { expr:'6⁵ × 6²', correct:'6⁷', distractors:[
+        {text:'6¹⁰', hint:'Careful — that comes from multiplying 5×2. For the Product Law we ADD the exponents: 5+2.'},
+        {text:'36⁷', hint:'Keep the base as 6, not 36. Multiplying the base changes the value of the whole expression.'},
+        {text:'6³',  hint:'That looks like 5−2. Multiplying powers means we ADD exponents, not subtract them.'}
+      ]},
+      { expr:'a⁷ × a² × a³', correct:'a¹²', distractors:[
+        {text:'a⁴²', hint:'Don\'t multiply the exponents together! Add all three instead: 7+2+3.'},
+        {text:'a²¹', hint:'That\'s 7×3. With three factors, add every exponent: 7+2+3.'},
+        {text:'a¹⁴', hint:'Close, but check your addition — 7+2+3 is not 14. Try again.'}
+      ]}
+    ]
+  },
+  {
+    key: 'quotient',
+    title: 'The Quotient Law',
+    caseNo: 'CASE FILE 02',
+    rule: 'aᵐ ÷ aⁿ = aᵐ⁻ⁿ',
+    ruleSpoken: 'a to the m, divided by a to the n, equals a to the power of m minus n.',
+    explain: 'When you divide two powers with the SAME base, keep the base and SUBTRACT the bottom exponent from the top one.',
+    missionTitle: 'The Case of the Vanishing Powers',
+    caption: 'Same base? SUBTRACT the exponents.',
+    flavor: 'Detective, a new lead: when one power divides another with the SAME base, the exponents don\'t add — they cancel out, layer by layer. Your job — figure out HOW they shrink. Watch out for imposters who add the exponents instead!',
+    dragdrop: {
+      instructions: 'Build the Quotient Law. Drag the missing operation and the missing exponent into the empty slots.',
+      template: ['aᵐ', {slot:'op'}, 'aⁿ', '=', 'a', {slot:'exp', sup:true}],
+      slots: {
+        op:  { correct:'÷', options:['÷','×','+'],
+               hint:'This law is about sharing/splitting one power by another. Which sign means "divide"?' },
+        exp: { correct:'m−n', options:['m−n','m+n','m×n'],
+               hint:'Division undoes multiplication. Since multiplying powers means ADDING exponents, what should dividing powers do to the exponents?' }
+      }
+    },
+    questions: [
+      { expr:'7⁸ ÷ 7³', correct:'7⁵', distractors:[
+        {text:'7¹¹', hint:'Division is the opposite of multiplication. When multiplying we ADD exponents — when dividing we do the opposite of adding. What\'s the opposite of adding?'},
+        {text:'7²⁴', hint:'That comes from multiplying the exponents. For division, subtract them instead: 8−3.'},
+        {text:'7³',  hint:'Check the order — it\'s the top exponent minus the bottom one: 8−3, not 3−8.'}
+      ]},
+      { expr:'10⁹ ÷ 10⁴', correct:'10⁵', distractors:[
+        {text:'10¹³', hint:'Adding exponents is for multiplication. For division, subtract: 9−4.'},
+        {text:'100⁵', hint:'Keep the base as 10 — don\'t change it when you divide the powers.'},
+        {text:'10²·²⁵', hint:'You don\'t divide the exponents — subtract them instead: 9−4.'}
+      ]},
+      { expr:'x¹⁰ ÷ x⁴', correct:'x⁶', distractors:[
+        {text:'x¹⁴', hint:'That\'s 10+4. For the Quotient Law we subtract: 10−4.'},
+        {text:'x²·⁵', hint:'You don\'t divide the exponents — subtract the bottom one from the top one: 10−4.'},
+        {text:'x⁴⁰', hint:'That comes from multiplying 10×4. Division of powers means subtracting exponents: 10−4.'}
+      ]}
+    ]
+  },
+  {
+    key: 'power',
+    title: 'The Power Law',
+    caseNo: 'CASE FILE 03',
+    rule: '(aᵐ)ⁿ = aᵐ×ⁿ',
+    ruleSpoken: 'a to the m, all raised to the power of n, equals a to the power of m times n.',
+    explain: 'When you raise a power to another power, keep the base and MULTIPLY the two exponents together.',
+    missionTitle: 'The Case of the Double Cross',
+    caption: 'Power of a power? MULTIPLY the exponents.',
+    flavor: 'Detective, this suspect has an alibi wrapped in brackets — a power raised to another power. Your job — unwrap it and find out how the exponents really combine. Watch out for imposters who add the exponents instead!',
+    dragdrop: {
+      instructions: 'Build the Power Law. Drag the missing exponent expression into the slot.',
+      template: ['(aᵐ)ⁿ', '=', 'a', {slot:'exp', sup:true}],
+      slots: {
+        exp: { correct:'m×n', options:['m×n','m+n','m−n'],
+               hint:'(aᵐ)ⁿ means aᵐ multiplied by itself n times — that\'s Product Law thinking, adding m to itself n times. What single operation is repeated addition the same as?' }
+      }
+    },
+    questions: [
+      { expr:'(2³)⁴', correct:'2¹²', distractors:[
+        {text:'2⁷',  hint:'(2³)⁴ means 2³×2³×2³×2³. Use the Product Law here — what is 3+3+3+3? Now think of a faster way to get that: 3×4.'},
+        {text:'2¹',  hint:'You don\'t subtract exponents here. Multiply them instead: 3×4.'},
+        {text:'2¹⁰', hint:'Check your multiplication — 3×4 is not 10.'}
+      ]},
+      { expr:'(5²)³', correct:'5⁶', distractors:[
+        {text:'5⁵',  hint:'That\'s 2+3, which is Product Law thinking. For a power raised to a power, MULTIPLY: 2×3.'},
+        {text:'5¹',  hint:'Subtraction isn\'t used here. Multiply the two exponents: 2×3.'},
+        {text:'5⁸',  hint:'Check your multiplication of the exponents — 2×3 is not 8.'}
+      ]},
+      { expr:'(y⁵)²', correct:'y¹⁰', distractors:[
+        {text:'y⁷',  hint:'That\'s 5+2. (y⁵)² means y⁵×y⁵ — use Product Law to add the exponents first (5+5), then notice that\'s the same as multiplying: 5×2.'},
+        {text:'y³',  hint:'We don\'t subtract exponents for the Power Law. Multiply them: 5×2.'},
+        {text:'y²⁵', hint:'Careful with your times table — 5×2 is not 25.'}
+      ]}
+    ]
+  },
+  {
+    key: 'distribution',
+    title: 'The Distribution Law',
+    caseNo: 'CASE FILE 04',
+    rule: '(ab)ᵐ = aᵐbᵐ',
+    ruleSpoken: 'a times b, all raised to the power of m, equals a to the power of m, times b to the power of m.',
+    explain: 'When a power applies to a bracket containing a PRODUCT, that exponent applies to EVERY factor inside the bracket, not just the first one.',
+    missionTitle: 'The Case of the Missing Partner',
+    caption: 'Power over a bracket? EVERY factor gets the exponent.',
+    flavor: 'Detective, a factor has gone missing from the crime scene. When a power sits outside a bracket holding two factors, it applies to BOTH of them — not just the one closest to the exponent. Watch out for imposters who leave one factor unmarked!',
+    dragdrop: {
+      instructions: 'Build the Distribution Law. Drag the missing exponent onto each base — the exponent applies to BOTH factors inside the bracket.',
+      template: ['(a×b)ᵐ', '=', 'a', {slot:'exp1', sup:true}, '×', 'b', {slot:'exp2', sup:true}],
+      slots: {
+        exp1: { correct:'m', options:['m','1','0'],
+                hint:'The outside exponent m applies to every factor inside the bracket — including a. What exponent goes on a?' },
+        exp2: { correct:'m', options:['m','1','0'],
+                hint:'Don\'t forget b! The SAME exponent m that applies to a also applies to b. What exponent goes on b?' }
+      }
+    },
+    questions: [
+      { expr:'(4×5)²', correct:'4²×5²', distractors:[
+        {text:'4²×5',   hint:'(4×5)² means (4×5)×(4×5) = 4×5×4×5. The exponent 2 applies to EVERYTHING in the bracket, not just the 4.'},
+        {text:'4²+5²',  hint:'Try rearranging 4×5×4×5 — the factors are multiplied together, not added. Can you group the two 4s and the two 5s?'},
+        {text:'4×5²',   hint:'The exponent applies to BOTH factors inside the bracket, not just the last one. What happens to the 4?'}
+      ]},
+      { expr:'(2×3)⁴', correct:'2⁴×3⁴', distractors:[
+        {text:'2⁴×3',  hint:'The exponent 4 must apply to every factor inside the bracket — including the 3.'},
+        {text:'2⁴+3⁴', hint:'(2×3)⁴ is a chain of multiplication, not addition. Rearrange the repeated factors of 2 and 3.'},
+        {text:'2×3⁴',  hint:'Don\'t forget the 2 — the exponent applies to it too, not just the 3.'}
+      ]},
+      { expr:'(3m)⁴', correct:'3⁴m⁴', distractors:[
+        {text:'3m⁴',   hint:'(3m)⁴ means (3×m)×(3×m)×(3×m)×(3×m). The exponent 4 applies to BOTH the 3 AND the m — not just m.'},
+        {text:'3⁴+m⁴', hint:'This is repeated multiplication of the bracket, not addition. Group the 3s together and the ms together.'},
+        {text:'3×m⁴',  hint:'The coefficient 3 needs the exponent too! It becomes 3⁴, not just 3.'}
+      ]},
+      { expr:'(7n)²', correct:'7²n²', distractors:[
+        {text:'7n²',  hint:'The exponent 2 belongs on BOTH the 7 and the n, since (7n)² = (7×n)×(7×n).'},
+        {text:'7²+n²',hint:'This is multiplication repeated, not addition — (7n)² = 7×n×7×n.'},
+        {text:'7×n²', hint:'Don\'t leave the 7 without its exponent — it needs to become 7² too.'}
+      ]}
+    ]
+  },
+  {
+    key: 'zero',
+    title: 'The Zero Exponent Law',
+    caseNo: 'CASE FILE 05',
+    rule: 'a⁰ = 1  (for a ≠ 0)',
+    ruleSpoken: 'a to the power of zero equals 1, as long as a is not zero.',
+    explain: 'Any non-zero base raised to the power of zero always equals 1 — no matter what the base is.',
+    missionTitle: 'The Case of the Empty Vault',
+    caption: 'Any base to the power zero? Always 1.',
+    flavor: 'Detective, the strangest case yet: a vault marked with the exponent zero, and no one agrees what\'s inside. Your job — crack it open and prove what a zero exponent really means. Watch out for imposters who think it\'s zero, or just the base itself!',
+    dragdrop: {
+      instructions: 'Build the Zero Exponent Law. Drag the correct value into the slot.',
+      template: ['a', {slot:'exp0', sup:true}, '=', {slot:'result'}],
+      slots: {
+        exp0:   { correct:'0', options:['0','1','m'],
+                  hint:'This law is about a very special exponent — the one that makes any power equal to 1. What number is that exponent?' },
+        result: { correct:'1', options:['1','0','a'],
+                  hint:'Think about aᵐ ÷ aᵐ. Using the Quotient Law that\'s aᵐ⁻ᵐ = a⁰. But aᵐ÷aᵐ is really anything divided by itself. What does that always equal?' }
+      }
+    },
+    questions: [
+      { expr:'9⁰', correct:'1', distractors:[
+        {text:'0', hint:'What is 2³÷2³? Using the Quotient Law: 2³⁻³ = 2⁰. But 2³÷2³ = 8÷8. What does anything divided by itself equal?'},
+        {text:'9', hint:'A zero exponent doesn\'t leave the base unchanged. Think about aᵐ÷aᵐ = a⁰ — and anything divided by itself equals 1.'}
+      ]},
+      { expr:'15⁰', correct:'1', distractors:[
+        {text:'0',  hint:'Try 5²÷5² using the Quotient Law: 5²⁻² = 5⁰. But 5²÷5² = 25÷25. What is that equal to?'},
+        {text:'15', hint:'The base doesn\'t "survive" a zero exponent unchanged — a⁰ always equals 1, regardless of the base.'}
+      ]},
+      { expr:'If a ≠ 0, what does a⁰ equal?', correct:'1', distractors:[
+        {text:'0', hint:'Picture aᵐ÷aᵐ. By the Quotient Law that\'s aᵐ⁻ᵐ = a⁰ — and any number divided by itself is 1, not 0.'},
+        {text:'a', hint:'A zero exponent always gives 1, no matter what a is — it never just leaves the base as it is.'}
+      ]}
+    ]
+  }
+];
+
+// Mission 6 — mixed practice, less scaffolding (shorter hints), one from each law
+// plus a couple of tougher combined ones.
+const MIXED_QUESTIONS = [
+  { law:'Product Law', expr:'5² × 5⁶', correct:'5⁸', distractors:[
+    {text:'5¹²', hint:'Same base, multiplying — add the exponents, don\'t multiply them.'},
+    {text:'5⁴',  hint:'Add, don\'t subtract, when multiplying powers with the same base.'}
+  ]},
+  { law:'Quotient Law', expr:'8¹² ÷ 8⁵', correct:'8⁷', distractors:[
+    {text:'8¹⁷', hint:'Dividing powers means subtracting exponents, not adding.'},
+    {text:'8⁶⁰', hint:'Don\'t multiply the exponents — subtract: 12−5.'}
+  ]},
+  { law:'Power Law', expr:'(4²)³', correct:'4⁶', distractors:[
+    {text:'4⁵', hint:'A power raised to a power means multiplying the exponents, not adding.'},
+    {text:'4¹', hint:'Multiply the exponents: 2×3, don\'t subtract them.'}
+  ]},
+  { law:'Distribution Law', expr:'(2×x)⁵', correct:'2⁵x⁵', distractors:[
+    {text:'2⁵x', hint:'The exponent applies to every factor in the bracket, including x.'},
+    {text:'2×x⁵', hint:'Don\'t forget the 2 needs the exponent too.'}
+  ]},
+  { law:'Zero Exponent', expr:'23⁰', correct:'1', distractors:[
+    {text:'0',  hint:'Any non-zero base to the power 0 is 1, not 0.'},
+    {text:'23', hint:'A zero exponent always gives 1 — the base doesn\'t stay the same.'}
+  ]},
+  { law:'Combined', expr:'(3² × 3³) ÷ 3⁴', correct:'3¹', distractors:[
+    {text:'3⁹',  hint:'First combine the bracket with Product Law (2+3=5), then apply Quotient Law: 5−4.'},
+    {text:'3¹⁰', hint:'Work step by step: inside the bracket first (add exponents), then divide (subtract exponents).'}
+  ]}
+];
+
+// Final Challenge — guided, step-by-step simplification of one expression.
+const FINAL_EXPR = '(3² × 3³)⁴ ÷ 3⁵';
+const FINAL_STEPS = [
+  { prompt:'Step 1 — Simplify inside the brackets first: 3² × 3³', law:'Product Law (add exponents)',
+    correct:'3⁵', distractors:[
+      {text:'3⁶', hint:'Add the exponents: 2+3, not multiply them.'},
+      {text:'3¹', hint:'Add, don\'t subtract, when multiplying powers with the same base: 2+3.'}
+    ]},
+  { prompt:'Step 2 — Now apply the outer power: (3⁵)⁴', law:'Power Law (multiply exponents)',
+    correct:'3²⁰', distractors:[
+      {text:'3⁹', hint:'A power raised to a power means multiplying the exponents: 5×4, not adding.'},
+      {text:'3¹', hint:'Multiply, don\'t subtract, the two exponents: 5×4.'}
+    ]},
+  { prompt:'Step 3 — Finally divide: 3²⁰ ÷ 3⁵', law:'Quotient Law (subtract exponents)',
+    correct:'3¹⁵', distractors:[
+      {text:'3²⁵', hint:'Dividing powers means subtracting exponents: 20−5, not adding.'},
+      {text:'3⁴',  hint:'Subtract the exponents in the right order: 20−5.'}
+    ]}
+];
+
+const TOTAL_QUESTIONS = LAWS.reduce((s,l)=>s+l.questions.length,0) + MIXED_QUESTIONS.length + FINAL_STEPS.length;
+
+/* ---------------------------- 2. STATE ---------------------------------- */
+
+// Build the ordered list of screens the learner moves through.
+// Each law now has 3 stops: first LEARN the law (read the rule + meaning),
+// then BUILD it via drag-and-drop, then PRACTICE with questions.
+const SCREENS = [{type:'intro'}];
+LAWS.forEach((law, i) => {
+  SCREENS.push({type:'teach', lawIndex:i});
+  SCREENS.push({type:'dragdrop', lawIndex:i});
+  SCREENS.push({type:'mission', lawIndex:i});
+});
+SCREENS.push({type:'mixed'});
+SCREENS.push({type:'final'});
+SCREENS.push({type:'cert'});
+
+const state = {
+  screenIndex: 0,
+  soundOn: false,
+  score: 0,
+  answeredCorrect: new Set(),  // unique keys of questions answered correctly, so retries don't double count
+  learnerName: '',
+  // per-mission mutable question/dragdrop progress, keyed by lawIndex
+  missionState: {},
+  mixedState: { qIndex:0 },
+  finalState: { step:0 }
+};
+LAWS.forEach((law,i) => {
+  state.missionState[i] = {
+    dragdrop: buildDragDropState(law.dragdrop),
+    qIndex: 0
+  };
+});
+
+function buildDragDropState(config){
+  const slots = {};
+  Object.keys(config.slots).forEach(key=>{
+    slots[key] = { filled:null, correct:false };
+  });
+  return { slots, complete:false };
+}
+
+/* -------------------------- 3. UTILITIES --------------------------------- */
+
+function shuffle(arr){
+  const a = arr.slice();
+  for(let i=a.length-1;i>0;i--){
+    const j = Math.floor(Math.random()*(i+1));
+    [a[i],a[j]]=[a[j],a[i]];
+  }
+  return a;
+}
+
+function speak(text){
+  if(!state.soundOn) return;
+  if(!('speechSynthesis' in window)) return;
+  window.speechSynthesis.cancel();
+  const utter = new SpeechSynthesisUtterance(text);
+  utter.rate = 0.95;
+  utter.pitch = 1.0;
+  window.speechSynthesis.speak(utter);
+}
+
+function el(html){
+  const div = document.createElement('div');
+  div.innerHTML = html.trim();
+  return div.firstElementChild;
+}
+
+function goTo(index){
+  state.screenIndex = Math.max(0, Math.min(SCREENS.length-1, index));
+  render();
+  window.scrollTo({top:0, behavior:'smooth'});
+}
+function nextScreen(){ goTo(state.screenIndex+1); }
+
+function markCorrect(uniqueKey){
+  if(!state.answeredCorrect.has(uniqueKey)){
+    state.answeredCorrect.add(uniqueKey);
+    state.score++;
+  }
+}
+
+/* --------------------------- 4. RENDERERS --------------------------------- */
+
+function render(){
+  const app = document.getElementById('app');
+  const screen = SCREENS[state.screenIndex];
+
+  app.innerHTML = '';
+  app.appendChild(renderMasthead());
+
+  // A "mission panel" (Mission X of 6 + score + progress + numbered dots)
+  // shows on any screen that belongs to one of the 6 missions (5 laws +
+  // mixed practice). Intro / Final Challenge / Certificate don't get one.
+  const missionNumber = getMissionNumber(screen);
+  if(missionNumber){
+    const progressPct = Math.round((state.screenIndex/(SCREENS.length-1))*100);
+    app.appendChild(renderMissionPanel(missionNumber, 6, progressPct));
+  }
+
+  let body;
+  switch(screen.type){
+    case 'intro':    body = renderIntro(); break;
+    case 'teach':    body = renderTeach(screen.lawIndex); break;
+    case 'dragdrop': body = renderDragDrop(screen.lawIndex); break;
+    case 'mission':  body = renderMission(screen.lawIndex); break;
+    case 'mixed':    body = renderMixed(); break;
+    case 'final':    body = renderFinal(); break;
+    case 'cert':     body = renderCertificate(); break;
+  }
+  app.appendChild(body);
+
+  const foot = el(`<footer class="note">🔎 Exponent Detective Agency — a Grade 8 exponent-law training file. No external resources used.</footer>`);
+  app.appendChild(foot);
+}
+
+function getMissionNumber(screen){
+  if(screen.type==='teach' || screen.type==='dragdrop' || screen.type==='mission') return screen.lawIndex+1;
+  if(screen.type==='mixed' || screen.type==='final') return 6;
+  return null;
+}
+
+function magnifierSvg(){
+  return `<svg width="30" height="30" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <circle cx="10.5" cy="10.5" r="6.5" stroke="#e8c46e" stroke-width="2"/>
+    <line x1="15.2" y1="15.2" x2="21" y2="21" stroke="#e8c46e" stroke-width="2.4" stroke-linecap="round"/>
+  </svg>`;
+}
+
+/* Top masthead: the agency's letterhead. Shown on every screen. */
+function renderMasthead(){
+  const mast = el(`
+    <div class="masthead">
+      <button class="sound-btn masthead-sound" id="soundToggle" aria-pressed="${state.soundOn}">
+        ${state.soundOn ? '🔊 Sound ON' : '🔇 Sound OFF'}
+      </button>
+      <div class="masthead-title">${magnifierSvg()} <span>Exponent Detective Agency</span></div>
+      <div class="masthead-sub">Case File No. 8 — The Mystery of the Missing Exponent Rules</div>
+    </div>
+  `);
+  mast.querySelector('#soundToggle').addEventListener('click', ()=>{
+    state.soundOn = !state.soundOn;
+    if(!state.soundOn && 'speechSynthesis' in window) window.speechSynthesis.cancel();
+    render();
+  });
+  return mast;
+}
+
+/* "Mission X of 6" strip: score, progress bar, and the six numbered dots. */
+function renderMissionPanel(missionNumber, missionTotal, progressPct){
+  let dots = '';
+  for(let i=1;i<=missionTotal;i++){
+    let cls = 'dot';
+    if(i===missionNumber) cls += ' active';
+    else if(i<missionNumber) cls += ' done';
+    dots += `<div class="${cls}">${i}</div>`;
+  }
+  return el(`
+    <div class="mission-panel">
+      <div class="mission-panel-top">
+        <span>Mission ${missionNumber} of ${missionTotal}</span>
+        <span id="scoreDisplay">★ ${state.score} pts</span>
+      </div>
+      <div class="progress-track"><div class="progress-fill" style="width:${progressPct}%"></div></div>
+      <div class="dot-row">${dots}</div>
+    </div>
+  `);
+}
+
+/* ---- INTRO ---- */
+function renderIntro(){
+  const wrap = el(`
+    <div class="card">
+      <span class="case-tag">WELCOME, DETECTIVE</span>
+      <h1>The Case of the Missing Exponent Rules</h1>
+      <p class="lede">Five mathematical rules have been scrambled across town, and it's your job to crack each code, rebuild the rule, and prove you can use it. Every mission has two parts: first you <strong>build the rule</strong> by dragging pieces into place, then you <strong>crack real codes</strong> using it.</p>
+      <ul class="case-list">
+        <li><span class="num">1</span> The Product Law — multiplying powers</li>
+        <li><span class="num">2</span> The Quotient Law — dividing powers</li>
+        <li><span class="num">3</span> The Power Law — a power raised to a power</li>
+        <li><span class="num">4</span> The Distribution Law — powers over a bracket</li>
+        <li><span class="num">5</span> The Zero Exponent Law — the mystery of a⁰</li>
+        <li><span class="num">6</span> Mixed Practice + The Final Challenge</li>
+      </ul>
+      <p>Turn on <strong>🔊 Sound</strong> at the top any time — it reads each law aloud when it's introduced, and again just before you start each rule-building activity.</p>
+      <div class="btn-row">
+        <button class="btn btn-gold" id="startBtn">Open Case File 01 →</button>
+      </div>
+    </div>
+  `);
+  wrap.querySelector('#startBtn').addEventListener('click', nextScreen);
+  return wrap;
+}
+
+/* ---- TEACH (learn the law before touching anything) ---- */
+function renderTeach(lawIndex){
+  const law = LAWS[lawIndex];
+  const wrap = el(`
+    <div class="card teach-card">
+      <div class="eyebrow-gold">MISSION ${lawIndex+1} OF 6</div>
+      <h2 class="teach-title">${law.missionTitle}</h2>
+      <div class="rule-box-tan">
+        <span class="rule-eq">${law.rule}</span>
+        <span class="rule-sep">—</span>
+        <span class="rule-caption">${law.caption}</span>
+      </div>
+      <p class="teach-flavor">${law.flavor}</p>
+      <div class="btn-row center">
+        <button class="btn btn-gold" id="toDragBtn">Begin Investigation →</button>
+      </div>
+    </div>
+  `);
+  wrap.querySelector('#toDragBtn').addEventListener('click', nextScreen);
+  // Sound plays here: this is where the law itself is taught — spoken in plain
+  // words (ruleSpoken), never as the raw symbolic equation.
+  speak(law.ruleSpoken + ' ' + law.explain);
+  return wrap;
+}
+
+/* ---- DRAG AND DROP ---- */
+function renderDragDrop(lawIndex){
+  const law = LAWS[lawIndex];
+  const dd = law.dragdrop;
+  const ms = state.missionState[lawIndex].dragdrop;
+
+  const wrap = el(`
+    <div class="card">
+      <span class="case-tag">${law.caseNo} · BUILD THE RULE</span>
+      <h2>${law.title}</h2>
+      <p class="lede">${dd.instructions}</p>
+      <div class="equation-row" id="eqRow"></div>
+      <div class="tile-bank" id="tileBank" aria-label="Draggable pieces"></div>
+      <div class="feedback" id="ddFeedback" role="status" aria-live="polite"></div>
+      <div id="unlockArea"></div>
+    </div>
+  `);
+
+  const eqRow = wrap.querySelector('#eqRow');
+  const tileBank = wrap.querySelector('#tileBank');
+  const feedback = wrap.querySelector('#ddFeedback');
+  const unlockArea = wrap.querySelector('#unlockArea');
+
+  // Build shuffled option order once per slot (stable per render call).
+  const slotOptionOrder = {};
+  Object.keys(dd.slots).forEach(key=>{
+    slotOptionOrder[key] = shuffle(dd.slots[key].options);
+  });
+
+  let selectedTile = null; // {value, tileEl}
+
+  // Render equation row with static text + slots
+  dd.template.forEach(piece=>{
+    if(typeof piece === 'string'){
+      eqRow.appendChild(el(`<span class="eq-static">${piece}</span>`));
+    } else {
+      const slotState = ms.slots[piece.slot];
+      const span = document.createElement('span');
+      span.className = 'slot' + (slotState.correct ? ' filled correct' : '');
+      span.tabIndex = 0;
+      span.dataset.slot = piece.slot;
+      span.setAttribute('role','button');
+      span.setAttribute('aria-label', 'Drop zone for '+piece.slot);
+      span.textContent = slotState.correct ? slotState.filled : '[ ]';
+      eqRow.appendChild(span);
+
+      // click-to-place (works for mouse, touch, keyboard)
+      span.addEventListener('click', ()=> attemptPlace(piece.slot, span));
+      span.addEventListener('keydown', (e)=>{
+        if(e.key==='Enter' || e.key===' '){ e.preventDefault(); attemptPlace(piece.slot, span); }
+      });
+      // native drag target
+      span.addEventListener('dragover', e=>{ e.preventDefault(); span.classList.add('dragover'); });
+      span.addEventListener('dragleave', ()=> span.classList.remove('dragover'));
+      span.addEventListener('drop', e=>{
+        e.preventDefault();
+        span.classList.remove('dragover');
+        const val = e.dataTransfer.getData('text/plain');
+        placeValue(piece.slot, val, span);
+      });
+    }
+  });
+
+  // Render tile bank: gather all options from all slots together, shuffled
+  let allTiles = [];
+  Object.keys(dd.slots).forEach(key=>{
+    slotOptionOrder[key].forEach(optionText=>{
+      allTiles.push({value:optionText, forSlot:key});
+    });
+  });
+  allTiles = shuffle(allTiles);
+
+  allTiles.forEach((tileData, idx)=>{
+    const tile = el(`<span class="tile" draggable="true" tabindex="0" role="button" aria-label="Draggable piece ${tileData.value}">${tileData.value}</span>`);
+    tile.dataset.value = tileData.value;
+    tile.dataset.tileId = idx;
+    tileBank.appendChild(tile);
+
+    tile.addEventListener('click', ()=>{
+      if(tile.classList.contains('used')) return;
+      // toggle selection
+      tileBank.querySelectorAll('.tile').forEach(t=>t.classList.remove('selected'));
+      if(selectedTile && selectedTile.tileEl === tile){
+        selectedTile = null;
+      } else {
+        selectedTile = {value:tileData.value, tileEl:tile};
+        tile.classList.add('selected');
+      }
+    });
+    tile.addEventListener('dragstart', e=>{
+      e.dataTransfer.setData('text/plain', tileData.value);
+      tile.setAttribute('dragging','true');
+    });
+    tile.addEventListener('dragend', ()=> tile.removeAttribute('dragging'));
+  });
+
+  function attemptPlace(slotKey, slotEl){
+    if(ms.slots[slotKey].correct) return; // already solved
+    if(!selectedTile){
+      feedback.className = 'feedback show bad';
+      feedback.textContent = '👆 First select a piece from the tray below, then click this slot to place it.';
+      return;
+    }
+    placeValue(slotKey, selectedTile.value, slotEl);
+  }
+
+  function placeValue(slotKey, value, slotEl){
+    if(ms.slots[slotKey].correct) return;
+    const slotConfig = dd.slots[slotKey];
+    const isCorrect = value === slotConfig.correct;
+
+    slotEl.textContent = value;
+    slotEl.classList.add('filled');
+    slotEl.classList.remove('correct','incorrect');
+
+    if(isCorrect){
+      slotEl.classList.add('correct');
+      ms.slots[slotKey].correct = true;
+      ms.slots[slotKey].filled = value;
+      feedback.className = 'feedback show good';
+      feedback.textContent = '✅ Correct! Great detective work — that piece belongs there!';
+      if(selectedTile) { selectedTile.tileEl.classList.add('used'); }
+      // remove any other tiles with the identical value+forSlot only this one (keep others usable)
+    } else {
+      slotEl.classList.add('incorrect');
+      feedback.className = 'feedback show bad';
+      feedback.textContent = '🔴 Not quite! ' + slotConfig.hint;
+      // reset slot back to empty after a short delay so they can try again
+      setTimeout(()=>{
+        if(!ms.slots[slotKey].correct){
+          slotEl.textContent = '[ ]';
+          slotEl.classList.remove('filled','incorrect');
+        }
+      }, 1400);
+    }
+    if(selectedTile){
+      selectedTile.tileEl.classList.remove('selected');
+      selectedTile = null;
+    }
+    checkComplete();
+  }
+
+  function checkComplete(){
+    const allDone = Object.keys(ms.slots).every(k=>ms.slots[k].correct);
+    if(allDone && !ms.complete){
+      ms.complete = true;
+      const box = el(`
+        <div class="unlock-box">
+          <h3>🔓 CODE UNLOCKED! You discovered the ${law.title}!</h3>
+          <div class="rule-banner">${law.rule}</div>
+          <p>${law.explain}</p>
+          <div class="btn-row" style="justify-content:center;">
+            <button class="btn btn-gold" id="toMissionBtn">Start ${law.title} Missions →</button>
+          </div>
+        </div>
+      `);
+      unlockArea.appendChild(box);
+      box.querySelector('#toMissionBtn').addEventListener('click', nextScreen);
+    }
+  }
+
+  // if already complete on re-render (e.g., navigated back), show unlock box immediately
+  if(ms.complete){
+    checkComplete();
+  }
+
+  // Sound plays here: this is the instruction read right before the dragging activity begins.
+  speak(dd.instructions);
+  return wrap;
+}
+
+/* ---- MISSION (per-law MCQ series) ---- */
+function renderMission(lawIndex){
+  const law = LAWS[lawIndex];
+  const ms = state.missionState[lawIndex];
+  const qIndex = ms.qIndex;
+  const totalQ = law.questions.length;
+
+  if(qIndex >= totalQ){
+    // mission complete
+    const wrap = el(`
+      <div class="card">
+        <span class="case-tag">${law.caseNo} · SOLVED</span>
+        <h2>${law.title} — Case Closed! ✅</h2>
+        <div class="rule-banner">${law.rule}</div>
+        <p>${law.explain}</p>
+        <div class="btn-row">
+          <button class="btn btn-gold" id="nextCaseBtn">${lawIndex < LAWS.length-1 ? 'Open Next Case File →' : 'Continue to Mixed Practice →'}</button>
+        </div>
+      </div>
+    `);
+    wrap.querySelector('#nextCaseBtn').addEventListener('click', nextScreen);
+    return wrap;
+  }
+
+  return renderQuestionCard({
+    tag: `${law.caseNo} · QUESTION ${qIndex+1} OF ${totalQ}`,
+    title: law.title,
+    question: law.questions[qIndex],
+    uniqueKey: `law${lawIndex}-q${qIndex}`,
+    onCorrectContinue: ()=>{ ms.qIndex++; render(); },
+    ruleReminder: law.rule
+  });
+}
+
+/* ---- MIXED PRACTICE (Mission 6) ---- */
+function renderMixed(){
+  const qIndex = state.mixedState.qIndex;
+  if(qIndex >= MIXED_QUESTIONS.length){
+    const wrap = el(`
+      <div class="card">
+        <span class="case-tag">CASE FILE 06 · SOLVED</span>
+        <h2>Mixed Practice — Case Closed! ✅</h2>
+        <p>You cracked codes using every law in the book. Time for the Final Challenge.</p>
+        <div class="btn-row">
+          <button class="btn btn-gold" id="toFinalBtn">Begin the Final Challenge →</button>
+        </div>
+      </div>
+    `);
+    wrap.querySelector('#toFinalBtn').addEventListener('click', nextScreen);
+    return wrap;
+  }
+
+  const q = MIXED_QUESTIONS[qIndex];
+  return renderQuestionCard({
+    tag: `CASE FILE 06 · MIXED PRACTICE · QUESTION ${qIndex+1} OF ${MIXED_QUESTIONS.length}`,
+    title: q.law,
+    question: q,
+    uniqueKey: `mixed-q${qIndex}`,
+    onCorrectContinue: ()=>{ state.mixedState.qIndex++; render(); },
+    lessScaffold: true
+  });
+}
+
+/* ---- FINAL CHALLENGE ---- */
+function renderFinal(){
+  const step = state.finalState.step;
+  if(step >= FINAL_STEPS.length){
+    const wrap = el(`
+      <div class="card">
+        <span class="case-tag">FINAL CHALLENGE · SOLVED</span>
+        <h2>Mystery Solved! 🕵️‍♀️✅</h2>
+        <p class="lede">You fully simplified <span style="font-family:var(--font-code)">${FINAL_EXPR}</span> down to <strong style="font-family:var(--font-code)">3¹⁵</strong>, using the Product, Power, and Quotient Laws in order.</p>
+        <div class="btn-row">
+          <button class="btn btn-gold" id="toCertBtn">Claim Your Certificate →</button>
+        </div>
+      </div>
+    `);
+    wrap.querySelector('#toCertBtn').addEventListener('click', nextScreen);
+    return wrap;
+  }
+
+  const s = FINAL_STEPS[step];
+  const wrap = el(`<div></div>`);
+  const intro = step === 0 ? `
+    <div class="card">
+      <span class="case-tag">FINAL CHALLENGE</span>
+      <h2>The Last Code</h2>
+      <p class="lede">One final expression stands between you and your certificate. Simplify it completely, one step at a time, choosing the correct law at each stage.</p>
+      <div class="question-expr">${FINAL_EXPR}</div>
+    </div>` : '';
+  const introEl = intro ? el(intro) : null;
+  if(introEl) wrap.appendChild(introEl);
+
+  const card = renderQuestionCard({
+    tag: `FINAL CHALLENGE · STEP ${step+1} OF ${FINAL_STEPS.length}`,
+    title: s.law,
+    question: { expr:s.prompt, correct:s.correct, distractors:s.distractors },
+    uniqueKey: `final-step${step}`,
+    onCorrectContinue: ()=>{ state.finalState.step++; render(); },
+    lessScaffold: true,
+    isFinal:true
+  });
+  wrap.appendChild(card);
+  return wrap;
+}
+
+/* ---- Generic MCQ question card (shared by missions, mixed, final) ---- */
+function renderQuestionCard({tag, title, question, uniqueKey, onCorrectContinue, ruleReminder, lessScaffold, isFinal}){
+  const options = shuffle([
+    {text:question.correct, isCorrect:true},
+    ...question.distractors.map(d=>({text:d.text, isCorrect:false, hint:d.hint}))
+  ]);
+
+  const wrap = el(`
+    <div class="card">
+      <span class="case-tag">${tag}</span>
+      <h2>${title}</h2>
+      ${ruleReminder ? `<div class="rule-banner" style="font-size:1rem;">${ruleReminder}</div>` : ''}
+      <div class="q-tracker">${isFinal ? 'IDENTIFY THE LAW, THEN SIMPLIFY' : 'SIMPLIFY THE EXPRESSION'}</div>
+      <div class="question-expr">${question.expr}</div>
+      <div class="option-grid" id="optGrid"></div>
+      <div class="feedback" id="qFeedback" role="status" aria-live="polite"></div>
+      <div class="btn-row" id="continueRow"></div>
+    </div>
+  `);
+
+  const grid = wrap.querySelector('#optGrid');
+  const feedback = wrap.querySelector('#qFeedback');
+  const continueRow = wrap.querySelector('#continueRow');
+  let answered = false;
+
+  options.forEach(opt=>{
+    const btn = el(`<button class="option-btn" type="button">${opt.text}</button>`);
+    grid.appendChild(btn);
+    btn.addEventListener('click', ()=>{
+      if(answered) return;
+      if(opt.isCorrect){
+        answered = true;
+        btn.classList.add('correct');
+        grid.querySelectorAll('.option-btn').forEach(b=>b.setAttribute('disabled','true'));
+        markCorrect(uniqueKey);
+        const msg = `✅ Correct! ${question.expr} = ${question.correct}. You're on your way, detective! ⭐`;
+        feedback.className = 'feedback show good';
+        feedback.textContent = msg;
+        const nextBtn = el(`<button class="btn btn-gold">Continue →</button>`);
+        nextBtn.addEventListener('click', onCorrectContinue);
+        continueRow.appendChild(nextBtn);
+        renderHudScoreOnly();
+      } else {
+        btn.classList.add('incorrect');
+        feedback.className = 'feedback show bad';
+        feedback.innerHTML = `<span class="hint-icon">💡</span>${opt.hint}${lessScaffold ? '' : ' Try again!'}`;
+        setTimeout(()=>{
+          btn.classList.remove('incorrect');
+        }, 1200);
+      }
+    });
+  });
+
+  return wrap;
+}
+
+function renderHudScoreOnly(){
+  const scoreBox = document.getElementById('scoreDisplay');
+  if(scoreBox) scoreBox.textContent = `★ ${state.score} pts`;
+}
+
+/* ---- CERTIFICATE ---- */
+function renderCertificate(){
+  const hasName = state.learnerName.trim().length > 0;
+  const wrap = el(`
+    <div class="card">
+      ${!hasName ? `
+        <span class="case-tag">CASE COMPLETE</span>
+        <h2>All Cases Closed, Detective!</h2>
+        <p class="lede">Enter your name to generate your official Exponent Detective Certificate.</p>
+        <div class="name-input-row">
+          <input type="text" id="nameInput" placeholder="Type your name here" maxlength="40">
+          <button class="btn btn-gold" id="genCertBtn">Generate Certificate</button>
+        </div>
+      ` : `
+        <div class="certificate">
+          <div class="seal">🕵️‍♂️🔍</div>
+          <h1>Certificate of Detective Achievement</h1>
+          <p>This certifies that</p>
+          <div class="name">${escapeHtml(state.learnerName)}</div>
+          <p>has successfully cracked all six case files of the<br><strong>Exponent Detective Agency</strong>, mastering the Laws of Exponents.</p>
+          <p style="font-family:var(--font-code); font-size:1.1rem; color:var(--ink);">Final Score: ${state.score} / ${TOTAL_QUESTIONS}</p>
+          <p style="font-size:.85rem;">${new Date().toLocaleDateString(undefined, {year:'numeric', month:'long', day:'numeric'})}</p>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-gold" id="printBtn">🖨️ Print Certificate</button>
+          <button class="btn" id="restartBtn">Start Over</button>
+        </div>
+      `}
+    </div>
+  `);
+
+  if(!hasName){
+    const input = wrap.querySelector('#nameInput');
+    wrap.querySelector('#genCertBtn').addEventListener('click', ()=>{
+      state.learnerName = input.value.trim() || 'Detective';
+      render();
+    });
+    input.addEventListener('keydown', e=>{
+      if(e.key === 'Enter'){ wrap.querySelector('#genCertBtn').click(); }
+    });
+  } else {
+    wrap.querySelector('#printBtn').addEventListener('click', ()=> window.print());
+    wrap.querySelector('#restartBtn').addEventListener('click', ()=>{
+      if(confirm('Start the whole investigation over from the beginning?')){
+        resetState();
+        render();
+      }
+    });
+  }
+  return wrap;
+}
+
+function escapeHtml(str){
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+function resetState(){
+  state.screenIndex = 0;
+  state.score = 0;
+  state.answeredCorrect = new Set();
+  state.learnerName = '';
+  state.mixedState = { qIndex:0 };
+  state.finalState = { step:0 };
+  LAWS.forEach((law,i) => {
+    state.missionState[i] = {
+      dragdrop: buildDragDropState(law.dragdrop),
+      qIndex: 0
+    };
+  });
+}
+
+/* ------------------------------ 5. INIT ---------------------------------- */
+render();
+</script>
+
+
+</body></html>
